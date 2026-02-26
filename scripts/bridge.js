@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
@@ -8,36 +10,31 @@ const { XMLParser } = require("fast-xml-parser");
 const WXBizMsgCrypt = require("wechat-crypto");
 
 // ============================================================
-// ★ CONFIGURATION
+// Configuration — loaded from .env (see .env.example)
 // ============================================================
 const CONFIG = {
-  // WeCom > App > API Receive > Token
-  WECOM_TOKEN: process.env.WECOM_TOKEN || "YOUR_WECOM_TOKEN",
-  // WeCom > App > API Receive > EncodingAESKey
-  WECOM_AES_KEY: process.env.WECOM_AES_KEY || "YOUR_ENCODING_AES_KEY",
-  // WeCom > My Company > Company Info > CorpID
-  CORP_ID: process.env.CORP_ID || "YOUR_CORP_ID",
-  // WeCom > App > Secret
-  CORP_SECRET: process.env.CORP_SECRET || "YOUR_CORP_SECRET",
-  // WeCom > App > AgentId (Number)
-  AGENT_ID: parseInt(process.env.AGENT_ID || "1000000", 10),
-  // The `hooks.token` value from your openclaw.json
-  OPENCLAW_TOKEN: process.env.OPENCLAW_TOKEN || "YOUR_OPENCLAW_TOKEN",
-  // OpenClaw webhook port (default: 18789)
-  OPENCLAW_PORT: 18789,
-  // Port for this bridge to listen on
-  BRIDGE_PORT: 3000,
-  // OpenClaw sessions directory
-  SESSIONS_DIR:
-    process.env.SESSIONS_DIR || "/home/ubuntu/.openclaw/agents/main/sessions",
+  WECOM_TOKEN:    process.env.WECOM_TOKEN,
+  WECOM_AES_KEY:  process.env.WECOM_AES_KEY,
+  CORP_ID:        process.env.CORP_ID,
+  CORP_SECRET:    process.env.CORP_SECRET,
+  AGENT_ID:       parseInt(process.env.AGENT_ID || "1000000", 10),
+  OPENCLAW_TOKEN: process.env.OPENCLAW_TOKEN,
+  OPENCLAW_PORT:  parseInt(process.env.OPENCLAW_PORT || "18789", 10),
+  BRIDGE_PORT:    parseInt(process.env.BRIDGE_PORT || "3000", 10),
+  SESSIONS_DIR:   process.env.SESSIONS_DIR || "/home/ubuntu/.openclaw/agents/main/sessions",
 };
+
+// Validate required config values on startup
+const REQUIRED = ["WECOM_TOKEN", "WECOM_AES_KEY", "CORP_ID", "CORP_SECRET", "OPENCLAW_TOKEN"];
+const missing = REQUIRED.filter((k) => !CONFIG[k]);
+if (missing.length > 0) {
+  console.error(`\n❌ Missing required environment variables: ${missing.join(", ")}`);
+  console.error("   Please copy .env.example to .env and fill in all required values.\n");
+  process.exit(1);
+}
 // ============================================================
 
-const cryptor = new WXBizMsgCrypt(
-  CONFIG.WECOM_TOKEN,
-  CONFIG.WECOM_AES_KEY,
-  CONFIG.CORP_ID
-);
+const cryptor = new WXBizMsgCrypt(CONFIG.WECOM_TOKEN, CONFIG.WECOM_AES_KEY, CONFIG.CORP_ID);
 const xmlParser = new XMLParser();
 const app = express();
 app.use(express.raw({ type: "*/*" }));
@@ -59,19 +56,9 @@ async function sendTextToWecom(userId, text) {
     const accessToken = await getAccessToken();
     const res = await axios.post(
       `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
-      {
-        touser: userId,
-        msgtype: "text",
-        agentid: CONFIG.AGENT_ID,
-        text: { content: text },
-      }
+      { touser: userId, msgtype: "text", agentid: CONFIG.AGENT_ID, text: { content: text } }
     );
-    console.log(
-      "✅ Text sent to:",
-      userId,
-      "| WeCom API response:",
-      JSON.stringify(res.data)
-    );
+    console.log("✅ Text sent to:", userId, "| WeCom API response:", JSON.stringify(res.data));
   } catch (e) {
     console.error("❌ Failed to send text message:", e.message);
   }
@@ -85,42 +72,27 @@ async function sendImageToWecom(userId, imagePath) {
       await sendTextToWecom(userId, `Image file not found: ${imagePath}`);
       return;
     }
-
     const accessToken = await getAccessToken();
     const form = new FormData();
     form.append("media", fs.createReadStream(imagePath), {
       filename: path.basename(imagePath),
       contentType: "image/png",
     });
-
     const uploadRes = await axios.post(
       `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${accessToken}&type=image`,
       form,
       { headers: form.getHeaders() }
     );
-
     if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
       throw new Error(`Failed to upload image: ${uploadRes.data.errmsg}`);
     }
-
     const mediaId = uploadRes.data.media_id;
     console.log("📎 Image uploaded, media_id:", mediaId);
-
     const sendRes = await axios.post(
       `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
-      {
-        touser: userId,
-        msgtype: "image",
-        agentid: CONFIG.AGENT_ID,
-        image: { media_id: mediaId },
-      }
+      { touser: userId, msgtype: "image", agentid: CONFIG.AGENT_ID, image: { media_id: mediaId } }
     );
-    console.log(
-      "✅ Image sent to:",
-      userId,
-      "| WeCom API response:",
-      JSON.stringify(sendRes.data)
-    );
+    console.log("✅ Image sent to:", userId, "| WeCom API response:", JSON.stringify(sendRes.data));
   } catch (e) {
     console.error("❌ Failed to send image:", e.message);
     await sendTextToWecom(userId, `Failed to send image: ${e.message}`);
@@ -131,8 +103,7 @@ async function sendImageToWecom(userId, imagePath) {
 function parseReply(rawText) {
   const finalMatch = rawText.match(/<final>([\s\S]*?)<\/final>/);
   const text = finalMatch ? finalMatch[1].trim() : rawText.trim();
-  const imageMatches = [...text.matchAll(/\[IMAGE:(.*?)\]/g)];
-  const imagePaths = imageMatches.map((m) => m[1].trim());
+  const imagePaths = [...text.matchAll(/\[IMAGE:(.*?)\]/g)].map((m) => m[1].trim());
   const textOnly = text.replace(/\[IMAGE:.*?\]/g, "").trim();
   return { textOnly, imagePaths };
 }
@@ -150,15 +121,8 @@ async function sendReplyToWecom(userId, rawReply) {
 async function getLatestAssistantReply(sessionFile, afterTimestamp) {
   return new Promise((resolve) => {
     const lines = [];
-    const rl = readline.createInterface({
-      input: fs.createReadStream(sessionFile),
-      crlfDelay: Infinity,
-    });
-    rl.on("line", (line) => {
-      try {
-        lines.push(JSON.parse(line));
-      } catch {}
-    });
+    const rl = readline.createInterface({ input: fs.createReadStream(sessionFile), crlfDelay: Infinity });
+    rl.on("line", (line) => { try { lines.push(JSON.parse(line)); } catch {} });
     rl.on("close", () => {
       const reply = lines.find(
         (l) =>
@@ -177,7 +141,7 @@ async function getLatestAssistantReply(sessionFile, afterTimestamp) {
   });
 }
 
-// --- Poll for OpenClaw's reply ---
+// --- Poll for OpenClaw's reply (up to maxWaitMs) ---
 async function waitForReply(sessionFile, afterTimestamp, maxWaitMs = 60000) {
   const interval = 1500;
   for (let i = 0; i < Math.ceil(maxWaitMs / interval); i++) {
@@ -194,10 +158,7 @@ function getLatestSessionFile() {
     const files = fs
       .readdirSync(CONFIG.SESSIONS_DIR)
       .filter((f) => f.endsWith(".jsonl"))
-      .map((f) => ({
-        fullPath: path.join(CONFIG.SESSIONS_DIR, f),
-        mtime: fs.statSync(path.join(CONFIG.SESSIONS_DIR, f)).mtime,
-      }))
+      .map((f) => ({ fullPath: path.join(CONFIG.SESSIONS_DIR, f), mtime: fs.statSync(path.join(CONFIG.SESSIONS_DIR, f)).mtime }))
       .sort((a, b) => b.mtime - a.mtime);
     return files.length > 0 ? files[0].fullPath : null;
   } catch (e) {
@@ -215,28 +176,16 @@ async function handleWecomMessage(userId, text) {
     const wakeRes = await axios.post(
       `http://127.0.0.1:${CONFIG.OPENCLAW_PORT}/hooks/wake`,
       { text: `【WeCom Message】User ${userId} says: ${text}`, mode: "now" },
-      {
-        headers: {
-          Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-      }
+      { headers: { Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}`, "Content-Type": "application/json" } }
     );
-    console.log(
-      "📤 Woke up OpenClaw, status:",
-      wakeRes.status,
-      "| Waiting for reply..."
-    );
+    console.log("📤 Woke up OpenClaw, status:", wakeRes.status, "| Waiting for reply...");
   } catch (e) {
     console.error("❌ Failed to wake OpenClaw:", e.message);
-    await sendTextToWecom(
-      userId,
-      "The service is temporarily unavailable. Please try again later."
-    );
+    await sendTextToWecom(userId, "The service is temporarily unavailable. Please try again later.");
     return;
   }
 
-  await new Promise((r) => setTimeout(r, 2000)); // Wait for session file to be created
+  await new Promise((r) => setTimeout(r, 2000));
 
   const sessionFile = getLatestSessionFile();
   if (!sessionFile) {
@@ -247,12 +196,8 @@ async function handleWecomMessage(userId, text) {
   console.log("📂 Polling session file:", path.basename(sessionFile));
 
   const reply = await waitForReply(sessionFile, sendTime, 60000);
-
   if (reply) {
-    console.log(
-      "💬 OpenClaw reply:",
-      reply.substring(0, 100) + (reply.length > 100 ? "..." : "")
-    );
+    console.log("💬 OpenClaw reply:", reply.substring(0, 100) + (reply.length > 100 ? "..." : ""));
     await sendReplyToWecom(userId, reply);
   } else {
     console.error("⏰ Timed out (60s) waiting for OpenClaw reply.");
@@ -277,15 +222,12 @@ app.all("/wecom", (req, res) => {
   }
 
   if (req.method === "POST") {
-    res.status(200).send("success"); // Immediately respond to WeCom's server
+    res.status(200).send("success");
     try {
       const xmlData = req.body.toString("utf-8");
       const parsed = xmlParser.parse(xmlData);
       const encrypted = parsed.xml?.Encrypt;
-      if (!encrypted) {
-        console.error("❌ No Encrypt field in message");
-        return;
-      }
+      if (!encrypted) { console.error("❌ No Encrypt field in message"); return; }
 
       const decrypted = cryptor.decrypt(encrypted);
       const message = xmlParser.parse(decrypted.message).xml;
@@ -306,11 +248,7 @@ app.all("/wecom", (req, res) => {
 
 // --- Start the server ---
 app.listen(CONFIG.BRIDGE_PORT, () => {
-  console.log(
-    `\n🚀 Webhook Bridge started, listening on port ${CONFIG.BRIDGE_PORT}`
-  );
-  console.log(
-    `   WeCom callback URL: http://YOUR_SERVER_IP:${CONFIG.BRIDGE_PORT}/wecom`
-  );
+  console.log(`\n🚀 Webhook Bridge started, listening on port ${CONFIG.BRIDGE_PORT}`);
+  console.log(`   WeCom callback URL: http://YOUR_SERVER_IP:${CONFIG.BRIDGE_PORT}/wecom`);
   console.log(`   Watching Sessions Dir: ${CONFIG.SESSIONS_DIR}`);
 });
