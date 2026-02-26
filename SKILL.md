@@ -92,9 +92,17 @@ WeCom User → WeCom Server → [Public Internet] → Webhook Bridge (Node.js) �
     pm2 start bridge.js --name wecom-bridge
     ```
 
-6.  Return to the WeCom admin console, enter `http://YOUR_PUBLIC_IP:3000/wecom` as the URL, and click **Save**. You should see `✅ URL validation successful` in the bridge logs (`pm2 logs wecom-bridge`).
+6.  **Firewall / Security Group**: Ensure the following ports are configured correctly on your server or cloud provider:
 
-7.  Go to **My Company** → **Security & Management** → **Trusted IPs**, and add your server's public IP address. (The bridge's startup log will display the exact IP to add.)
+    | Port | Direction | Action | Reason |
+    |---|---|---|---|
+    | **3000** (or your `BRIDGE_PORT`) | Inbound from public internet | **Open** | WeChat Work's servers must be able to reach the bridge. |
+    | **18789** (OpenClaw gateway) | Inbound from public internet | **Keep closed** | OpenClaw only listens on localhost; exposing it publicly is a security risk. |
+
+7.  **Trusted IP Whitelist**: In the WeCom Admin Console, go to **My Company** → **Security & Management** → **Trusted IPs**, and add your server's public IP address. Without this, the bridge will receive a `60020` error when trying to send messages back to users.
+    > The bridge's startup log (`npm start`) will print the exact IP to add.
+
+8.  Return to the WeCom admin console, enter `http://YOUR_PUBLIC_IP:3000/wecom` as the URL, and click **Save**. You should see `✅ URL validation successful` in the bridge logs (`pm2 logs wecom-bridge`).
 
 ### Step 3: Configure OpenClaw
 
@@ -136,3 +144,4 @@ WeCom User → WeCom Server → [Public Internet] → Webhook Bridge (Node.js) �
 ## Trust Statement
 
 By installing and using this skill, you understand and agree that your WeChat Work message data will be processed by the `bridge.js` service that you deploy and will be sent to your OpenClaw instance. Ensure you trust the security of the environment where you deploy this service.
+

@@ -2,6 +2,10 @@
 
 [![ClawHub](https://img.shields.io/badge/ClawHub-wecom--openclaw--bridge-blue)](https://clawhub.club/skills/wecom-openclaw-bridge) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+> **Channel Integration** — This project connects WeChat Work (WeCom) as a messaging 
+> channel to your OpenClaw agent, rather than extending the agent's capabilities as a 
+> traditional skill would.
+
 This repository contains a standard OpenClaw Skill for integrating WeChat Work (WeCom) with your OpenClaw agent. It enables seamless, bidirectional communication, allowing you to chat with your agent and receive responses (including text and images) directly within your WeCom application.
 
 ## Features
