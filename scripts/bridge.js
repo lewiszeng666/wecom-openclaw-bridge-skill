@@ -6,12 +6,30 @@ const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
 const FormData = require("form-data");
+const https = require("https");
+const http = require("http");
 const { XMLParser } = require("fast-xml-parser");
 const WXBizMsgCrypt = require("wechat-crypto");
 
 // ============================================================
 // Configuration — loaded from .env (see .env.example)
 // ============================================================
+
+// Auto-detect the OpenClaw sessions directory
+function detectSessionsDir() {
+  const os = require("os");
+  const candidates = [
+    path.join(os.homedir(), ".openclaw", "agents", "main", "sessions"),
+    "/root/.openclaw/agents/main/sessions",
+    "/home/ubuntu/.openclaw/agents/main/sessions",
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  // Fall back to home-based path even if it doesn't exist yet
+  return path.join(os.homedir(), ".openclaw", "agents", "main", "sessions");
+}
+
 const CONFIG = {
   WECOM_TOKEN:    process.env.WECOM_TOKEN,
   WECOM_AES_KEY:  process.env.WECOM_AES_KEY,
@@ -21,7 +39,7 @@ const CONFIG = {
   OPENCLAW_TOKEN: process.env.OPENCLAW_TOKEN,
   OPENCLAW_PORT:  parseInt(process.env.OPENCLAW_PORT || "18789", 10),
   BRIDGE_PORT:    parseInt(process.env.BRIDGE_PORT || "3000", 10),
-  SESSIONS_DIR:   process.env.SESSIONS_DIR || "/home/ubuntu/.openclaw/agents/main/sessions",
+  SESSIONS_DIR:   process.env.SESSIONS_DIR || detectSessionsDir(),
 };
 
 // Validate required config values on startup
@@ -246,9 +264,45 @@ app.all("/wecom", (req, res) => {
   }
 });
 
+// --- Detect public IP (tries multiple services, falls back gracefully) ---
+function getPublicIp() {
+  return new Promise((resolve) => {
+    const services = [
+      { host: "api4.ipify.org",        path: "/" },
+      { host: "ipv4.icanhazip.com",    path: "/" },
+      { host: "checkip.amazonaws.com", path: "/" },
+    ];
+    let tried = 0;
+    function tryNext() {
+      if (tried >= services.length) { resolve(null); return; }
+      const svc = services[tried++];
+      const req = https.get(
+        { host: svc.host, path: svc.path, timeout: 3000 },
+        (res) => {
+          let data = "";
+          res.on("data", (c) => (data += c));
+          res.on("end", () => {
+            const ip = data.trim();
+            if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) resolve(ip);
+            else tryNext();
+          });
+        }
+      );
+      req.on("error", tryNext);
+      req.on("timeout", () => { req.destroy(); tryNext(); });
+    }
+    tryNext();
+  });
+}
+
 // --- Start the server ---
-app.listen(CONFIG.BRIDGE_PORT, () => {
+app.listen(CONFIG.BRIDGE_PORT, async () => {
   console.log(`\n🚀 Webhook Bridge started, listening on port ${CONFIG.BRIDGE_PORT}`);
-  console.log(`   WeCom callback URL: http://YOUR_SERVER_IP:${CONFIG.BRIDGE_PORT}/wecom`);
+  const publicIp = await getPublicIp();
+  const callbackUrl = publicIp
+    ? `http://${publicIp}:${CONFIG.BRIDGE_PORT}/wecom`
+    : `http://YOUR_SERVER_IP:${CONFIG.BRIDGE_PORT}/wecom`;
+  console.log(`   WeCom callback URL: ${callbackUrl}`);
+  if (!publicIp) console.log(`   (Could not detect public IP — replace YOUR_SERVER_IP manually)`);
   console.log(`   Watching Sessions Dir: ${CONFIG.SESSIONS_DIR}`);
 });

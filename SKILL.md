@@ -2,7 +2,7 @@
 name: wecom-openclaw-bridge
 description: Integrates WeChat Work (WeCom) with OpenClaw for bidirectional messaging (text & images).
 homepage: https://github.com/lewiszeng666/wecom-openclaw-bridge-skill
-version: 1.1.1
+version: 1.1.0
 metadata:
   clawdbot:
     emoji: "💼"
@@ -93,6 +93,8 @@ WeCom User → WeCom Server → [Public Internet] → Webhook Bridge (Node.js) �
     ```
 
 6.  Return to the WeCom admin console, enter `http://YOUR_PUBLIC_IP:3000/wecom` as the URL, and click **Save**. You should see `✅ URL validation successful` in the bridge logs (`pm2 logs wecom-bridge`).
+
+7.  Go to **My Company** → **Security & Management** → **Trusted IPs**, and add your server's public IP address. (The bridge's startup log will display the exact IP to add.)
 
 ### Step 3: Configure OpenClaw
 
