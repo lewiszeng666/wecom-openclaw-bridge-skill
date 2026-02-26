@@ -17,7 +17,7 @@ const CONFIG = {
   WECOM_AES_KEY:  process.env.WECOM_AES_KEY,
   CORP_ID:        process.env.CORP_ID,
   CORP_SECRET:    process.env.CORP_SECRET,
-  AGENT_ID:       parseInt(process.env.AGENT_ID || "1000000", 10),
+  AGENT_ID:       parseInt(process.env.AGENT_ID || "0", 10),
   OPENCLAW_TOKEN: process.env.OPENCLAW_TOKEN,
   OPENCLAW_PORT:  parseInt(process.env.OPENCLAW_PORT || "18789", 10),
   BRIDGE_PORT:    parseInt(process.env.BRIDGE_PORT || "3000", 10),
@@ -25,7 +25,7 @@ const CONFIG = {
 };
 
 // Validate required config values on startup
-const REQUIRED = ["WECOM_TOKEN", "WECOM_AES_KEY", "CORP_ID", "CORP_SECRET", "OPENCLAW_TOKEN"];
+const REQUIRED = ["WECOM_TOKEN", "WECOM_AES_KEY", "CORP_ID", "CORP_SECRET", "AGENT_ID", "OPENCLAW_TOKEN"];
 const missing = REQUIRED.filter((k) => !CONFIG[k]);
 if (missing.length > 0) {
   console.error(`\n❌ Missing required environment variables: ${missing.join(", ")}`);

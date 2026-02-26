@@ -2,7 +2,7 @@
 name: wecom-openclaw-bridge
 description: Integrates WeChat Work (WeCom) with OpenClaw for bidirectional messaging (text & images).
 homepage: https://github.com/your-username/wecom-openclaw-bridge-skill
-version: 1.1.0
+version: 1.1.1
 metadata:
   clawdbot:
     emoji: "💼"
