@@ -124,19 +124,76 @@ description: Defines reply formatting rules for WeChat Work (WeCom) messages.
 
 When responding to a \`【WeCom Message】\`, reply normally. Do not execute any curl commands.
 
-If you generate or capture an image file, append the following tag at the end of your text reply:
+## Sending Media
 
-\`[IMAGE:/absolute/path/to/image.png]\`
+Append special tags at the end of your text reply to send media files:
 
-Example: Here is the screenshot you requested. \`[IMAGE:/tmp/screenshot.png]\`
+| 类型 | 格式 | 示例 |
+|------|------|------|
+| 🖼️ 图片 | \`[IMAGE:/绝对路径/图片.png]\` | \`[IMAGE:/tmp/screenshot.png]\` |
+| 🎤 语音 | \`[VOICE:/绝对路径/语音.amr]\` | \`[VOICE:/tmp/recording.amr]\` |
+| 🎬 视频 | \`[VIDEO:/绝对路径/视频.mp4]\` | \`[VIDEO:/tmp/clips.mp4]\` |
+| 📎 文件 | \`[FILE:/绝对路径/文件.pdf]\` | \`[FILE:/tmp/doc.pdf]\` |
 
-The webhook bridge will automatically detect this tag, upload the image, and deliver it to the user.
+### 注意
+
+- 语音仅支持 **amr** 格式
+- 图片支持 **png/jpg**
+- 视频支持 **mp4**
+- 文件会通过 WeCom API 发送
+
+The webhook bridge will automatically detect these tags and deliver the files.
 `;
 
   fs.writeFileSync(skillFile, content, "utf-8");
   ok(`wecom-replier skill created at: ${skillFile}`);
 }
-// ── 4. Detect sessions directory ─────────────────────────────────
+
+// ── 4. Update TOOLS.md ─────────────────────────────────────────
+function updateToolsMd(openclawHome) {
+  const toolsPath = path.join(openclawHome, "workspace", "TOOLS.md");
+  const templatePath = path.join(__dirname, "TOOLS.md.template");
+
+  let bridgeSection = "";
+  if (fs.existsSync(templatePath)) {
+    bridgeSection = fs.readFileSync(templatePath, "utf-8");
+    // Replace placeholders
+    const bridgePath = path.join(__dirname, "bridge.js");
+    const bridgePort = process.env.BRIDGE_PORT || "3000";
+    bridgeSection = bridgeSection
+      .replace(/\{\{BRIDGE_PATH\}\}/g, bridgePath)
+      .replace(/\{\{BRIDGE_PORT\}\}/g, bridgePort);
+  } else {
+    // Fallback: inline content
+    warn("TOOLS.md.template not found, using inline content.");
+    bridgeSection = `### WeCom Bridge
+
+**Bridge 路径:** ${path.join(__dirname, "bridge.js")}
+**端口:** ${process.env.BRIDGE_PORT || "3000"}
+
+**发送格式:** [IMAGE:/path], [VOICE:/path.amr], [VIDEO:/path.mp4], [FILE:/path]
+**接收格式:** ✅ 文字 ✅ 图片 ✅ 语音 ✅ 视频 ✅ 文件
+
+**定时任务:** sessionTarget 设为 main
+
+`;
+  }
+
+  let content = "";
+  if (fs.existsSync(toolsPath)) {
+    content = fs.readFileSync(toolsPath, "utf-8");
+    if (content.includes("### WeCom Bridge")) {
+      ok("TOOLS.md already has WeCom Bridge section, skipping.");
+      return;
+    }
+  }
+
+  content += "\n" + bridgeSection;
+  fs.writeFileSync(toolsPath, content, "utf-8");
+  ok("TOOLS.md updated with WeCom Bridge info.");
+}
+
+// ── 5. Detect sessions directory ─────────────────────────────────
 function detectSessionsDir(openclawHome) {
   const sessionsPath = path.join(openclawHome, "agents", "main", "sessions");
   // The directory may not exist yet if no session has been run
@@ -198,10 +255,13 @@ async function main() {
   // Step 3: Create wecom-replier skill
   createWecomReplierSkill(openclawHome);
 
-  // Step 4: Create .env
+  // Step 4: Update TOOLS.md
+  updateToolsMd(openclawHome);
+
+  // Step 5: Create .env
   createEnvFile(token);
 
-  // Step 5: Detect public IP
+  // Step 6: Detect public IP
   info("Detecting public IP address...");
   const bridgePort = process.env.BRIDGE_PORT || "3000";
   const publicIp   = await getPublicIp();
@@ -211,7 +271,7 @@ async function main() {
   if (publicIp) ok(`Public IP detected: ${publicIp}`);
   else warn("Could not detect public IP (no internet access?). Fill in manually.");
 
-  // Step 6: Detect sessions directory
+  // Step 7: Detect sessions directory
   const sessionsDir = detectSessionsDir(openclawHome);
   ok(`Sessions directory: ${sessionsDir}`);
 

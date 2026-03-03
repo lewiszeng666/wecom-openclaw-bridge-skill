@@ -1,0 +1,16 @@
+### WeCom Bridge
+
+**Bridge 路径:** {{BRIDGE_PATH}}
+**端口:** {{BRIDGE_PORT}}
+
+**发送格式 (发给你):**
+- 图片: `[IMAGE:/图片路径]`
+- 语音: `[VOICE:/语音路径.amr]`
+- 视频: `[VIDEO:/视频路径.mp4]`
+- 文件: `[FILE:/文件路径]`
+
+**接收格式 (你发给我):**
+- ✅ 文字 ✅ 图片 ✅ 语音 ✅ 视频 ✅ 文件
+
+**定时任务:** sessionTarget 设为 main（不是 isolated）
+
