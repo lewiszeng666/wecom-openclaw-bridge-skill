@@ -55,7 +55,7 @@ if (missing.length > 0) {
 const cryptor = new WXBizMsgCrypt(CONFIG.WECOM_TOKEN, CONFIG.WECOM_AES_KEY, CONFIG.CORP_ID);
 const xmlParser = new XMLParser();
 const app = express();
-app.use(express.raw({ type: "*/*" }));
+app.use(express.raw({ type: "*/*", limit: "15mb" }));
 
 // --- Get WeCom Access Token ---
 async function getAccessToken() {
@@ -117,21 +117,137 @@ async function sendImageToWecom(userId, imagePath) {
   }
 }
 
-// --- Parse AI reply to separate text and images ---
+// --- Upload and Send Voice to WeCom ---
+async function sendVoiceToWecom(userId, voicePath) {
+  try {
+    if (!fs.existsSync(voicePath)) {
+      console.error("❌ Voice file not found:", voicePath);
+      await sendTextToWecom(userId, `Voice file not found: ${voicePath}`);
+      return;
+    }
+    const accessToken = await getAccessToken();
+    const form = new FormData();
+    form.append("media", fs.createReadStream(voicePath), {
+      filename: path.basename(voicePath),
+      contentType: "audio/amr",  // WeCom only supports amr format
+    });
+    const uploadRes = await axios.post(
+      `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${accessToken}&type=voice`,
+      form,
+      { headers: form.getHeaders() }
+    );
+    if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
+      throw new Error(`Failed to upload voice: ${uploadRes.data.errmsg}`);
+    }
+    const mediaId = uploadRes.data.media_id;
+    console.log("🎤 Voice uploaded, media_id:", mediaId);
+    const sendRes = await axios.post(
+      `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
+      { touser: userId, msgtype: "voice", agentid: CONFIG.AGENT_ID, voice: { media_id: mediaId } }
+    );
+    console.log("✅ Voice sent to:", userId, "| WeCom API response:", JSON.stringify(sendRes.data));
+  } catch (e) {
+    console.error("❌ Failed to send voice:", e.message);
+    await sendTextToWecom(userId, `Failed to send voice: ${e.message}`);
+  }
+}
+
+// --- Upload and Send Video to WeCom ---
+async function sendVideoToWecom(userId, videoPath) {
+  try {
+    if (!fs.existsSync(videoPath)) {
+      console.error("❌ Video file not found:", videoPath);
+      await sendTextToWecom(userId, `Video file not found: ${videoPath}`);
+      return;
+    }
+    const accessToken = await getAccessToken();
+    const form = new FormData();
+    form.append("media", fs.createReadStream(videoPath), {
+      filename: path.basename(videoPath),
+      contentType: "video/mp4",
+    });
+    const uploadRes = await axios.post(
+      `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${accessToken}&type=video`,
+      form,
+      { headers: form.getHeaders() }
+    );
+    if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
+      throw new Error(`Failed to upload video: ${uploadRes.data.errmsg}`);
+    }
+    const mediaId = uploadRes.data.media_id;
+    console.log("🎬 Video uploaded, media_id:", mediaId);
+    const sendRes = await axios.post(
+      `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
+      { touser: userId, msgtype: "video", agentid: CONFIG.AGENT_ID, video: { media_id: mediaId } }
+    );
+    console.log("✅ Video sent to:", userId, "| WeCom API response:", JSON.stringify(sendRes.data));
+  } catch (e) {
+    console.error("❌ Failed to send video:", e.message);
+    await sendTextToWecom(userId, `Failed to send video: ${e.message}`);
+  }
+}
+
+// --- Upload and Send File to WeCom ---
+async function sendFileToWecom(userId, filePath) {
+  try {
+    if (!fs.existsSync(filePath)) {
+      console.error("❌ File not found:", filePath);
+      await sendTextToWecom(userId, `File not found: ${filePath}`);
+      return;
+    }
+    const accessToken = await getAccessToken();
+    const form = new FormData();
+    form.append("media", fs.createReadStream(filePath), {
+      filename: path.basename(filePath),
+      contentType: "application/octet-stream",
+    });
+    const uploadRes = await axios.post(
+      `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${accessToken}&type=file`,
+      form,
+      { headers: form.getHeaders() }
+    );
+    if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
+      throw new Error(`Failed to upload file: ${uploadRes.data.errmsg}`);
+    }
+    const mediaId = uploadRes.data.media_id;
+    console.log("📎 File uploaded, media_id:", mediaId);
+    const sendRes = await axios.post(
+      `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
+      { touser: userId, msgtype: "file", agentid: CONFIG.AGENT_ID, file: { media_id: mediaId } }
+    );
+    console.log("✅ File sent to:", userId, "| WeCom API response:", JSON.stringify(sendRes.data));
+  } catch (e) {
+    console.error("❌ Failed to send file:", e.message);
+    await sendTextToWecom(userId, `Failed to send file: ${e.message}`);
+  }
+}
+
+// --- Parse AI reply to separate text, images, voice, video, and files ---
 function parseReply(rawText) {
   const finalMatch = rawText.match(/<final>([\s\S]*?)<\/final>/);
   const text = finalMatch ? finalMatch[1].trim() : rawText.trim();
   const imagePaths = [...text.matchAll(/\[IMAGE:(.*?)\]/g)].map((m) => m[1].trim());
-  const textOnly = text.replace(/\[IMAGE:.*?\]/g, "").trim();
-  return { textOnly, imagePaths };
+  const voicePaths = [...text.matchAll(/\[VOICE:(.*?)\]/g)].map((m) => m[1].trim());
+  const videoPaths = [...text.matchAll(/\[VIDEO:(.*?)\]/g)].map((m) => m[1].trim());
+  const filePaths = [...text.matchAll(/\[FILE:(.*?)\]/g)].map((m) => m[1].trim());
+  const textOnly = text
+    .replace(/\[IMAGE:.*?\]/g, "")
+    .replace(/\[VOICE:.*?\]/g, "")
+    .replace(/\[VIDEO:.*?\]/g, "")
+    .replace(/\[FILE:.*?\]/g, "")
+    .trim();
+  return { textOnly, imagePaths, voicePaths, videoPaths, filePaths };
 }
 
-// --- Send final reply (text + images) to WeCom ---
+// --- Send final reply (text + images + voice + video + files) to WeCom ---
 async function sendReplyToWecom(userId, rawReply) {
-  const { textOnly, imagePaths } = parseReply(rawReply);
+  const { textOnly, imagePaths, voicePaths, videoPaths, filePaths } = parseReply(rawReply);
   if (textOnly) await sendTextToWecom(userId, textOnly);
   for (const imgPath of imagePaths) await sendImageToWecom(userId, imgPath);
-  if (!textOnly && imagePaths.length === 0)
+  for (const voicePath of voicePaths) await sendVoiceToWecom(userId, voicePath);
+  for (const videoPath of videoPaths) await sendVideoToWecom(userId, videoPath);
+  for (const filePath of filePaths) await sendFileToWecom(userId, filePath);
+  if (!textOnly && imagePaths.length === 0 && voicePaths.length === 0 && videoPaths.length === 0 && filePaths.length === 0)
     await sendTextToWecom(userId, "(Received an empty reply)");
 }
 
@@ -185,15 +301,57 @@ function getLatestSessionFile() {
   }
 }
 
-// --- Main handler for WeCom messages ---
-async function handleWecomMessage(userId, text) {
-  console.log(`\n📩 Processing message | User: ${userId} | Content: ${text}`);
+// --- Download media from WeCom API ---
+async function downloadMedia(mediaId, type = "image") {
+  try {
+    const accessToken = await getAccessToken();
+    const url = `https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token=${accessToken}&media_id=${mediaId}`;
+    const response = await axios({
+      method: 'get',
+      url: url,
+      responseType: 'stream'
+    });
+
+    const ext = type === "voice" ? "amr" : type === "video" ? "mp4" : "jpg";
+    const filename = `/tmp/wecom_${type}_${Date.now()}.${ext}`;
+    const writer = fs.createWriteStream(filename);
+
+    response.data.pipe(writer);
+
+    return new Promise((resolve, reject) => {
+      writer.on('finish', () => {
+        console.log(`📎 Downloaded ${type} to:`, filename);
+        resolve(filename);
+      });
+      writer.on('error', reject);
+    });
+  } catch (e) {
+    console.error(`❌ Failed to download ${type}:`, e.message);
+    return null;
+  }
+}
+
+// --- Handle WeCom message (text, image, voice, video, file) ---
+async function handleWecomMessage(userId, text, mediaType = null, mediaId = null) {
+  console.log(`\n📩 Processing message | User: ${userId} | Text: ${text || '(none)'} | Media: ${mediaType || 'none'}`);
+
+  let messageText = text || "";
+  let attachmentPath = null;
+
+  // If there's media, download it first
+  if (mediaType && mediaId) {
+    attachmentPath = await downloadMedia(mediaId, mediaType);
+    if (attachmentPath) {
+      messageText = `[${mediaType.toUpperCase()}:${attachmentPath}] ` + (text || "");
+    }
+  }
+
   const sendTime = new Date();
 
   try {
     const wakeRes = await axios.post(
       `http://127.0.0.1:${CONFIG.OPENCLAW_PORT}/hooks/wake`,
-      { text: `【WeCom Message】User ${userId} says: ${text}`, mode: "now" },
+      { text: `【WeCom Message】User ${userId} says: ${messageText}`, mode: "now" },
       { headers: { Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}`, "Content-Type": "application/json" } }
     );
     console.log("📤 Woke up OpenClaw, status:", wakeRes.status, "| Waiting for reply...");
@@ -213,12 +371,12 @@ async function handleWecomMessage(userId, text) {
   }
   console.log("📂 Polling session file:", path.basename(sessionFile));
 
-  const reply = await waitForReply(sessionFile, sendTime, 60000);
+  const reply = await waitForReply(sessionFile, sendTime, 300000);
   if (reply) {
     console.log("💬 OpenClaw reply:", reply.substring(0, 100) + (reply.length > 100 ? "..." : ""));
     await sendReplyToWecom(userId, reply);
   } else {
-    console.error("⏰ Timed out (60s) waiting for OpenClaw reply.");
+    console.error("⏰ Timed out (300s) waiting for OpenClaw reply.");
     await sendTextToWecom(userId, "The request timed out. Please try again later.");
   }
 }
@@ -254,6 +412,22 @@ app.all("/wecom", (req, res) => {
       if (message.MsgType === "text") {
         handleWecomMessage(message.FromUserName, message.Content).catch((e) => {
           console.error("❌ Error during message handling:", e.message);
+        });
+      } else if (message.MsgType === "image") {
+        handleWecomMessage(message.FromUserName, "[收到图片]", "image", message.MediaId).catch((e) => {
+          console.error("❌ Error during image handling:", e.message);
+        });
+      } else if (message.MsgType === "voice") {
+        handleWecomMessage(message.FromUserName, "[收到语音]", "voice", message.MediaId).catch((e) => {
+          console.error("❌ Error during voice handling:", e.message);
+        });
+      } else if (message.MsgType === "video") {
+        handleWecomMessage(message.FromUserName, "[收到视频]", "video", message.MediaId).catch((e) => {
+          console.error("❌ Error during video handling:", e.message);
+        });
+      } else if (message.MsgType === "file") {
+        handleWecomMessage(message.FromUserName, "[收到文件]", "file", message.MediaId).catch((e) => {
+          console.error("❌ Error during file handling:", e.message);
         });
       } else {
         console.log("⚠️ Unsupported message type:", message.MsgType, "(ignored)");
