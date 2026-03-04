@@ -1,7 +1,7 @@
 {
   "name": "wecom-openclaw-bridge",
-  "version": "1.2.0",
-  "description": "A webhook bridge for connecting WeChat Work (WeCom) to OpenClaw.",
+  "version": "3.1.0",
+  "description": "Enterprise-grade bridge for multi-channel WeCom to multi-instance OpenClaw messaging.",
   "main": "bridge.js",
   "scripts": {
     "start": "node bridge.js",

@@ -1,55 +1,27 @@
 ---
 name: wecom-openclaw-bridge
-description: Integrates WeChat Work (WeCom) with OpenClaw for bidirectional messaging (text & images).
+description: Enterprise-grade bridge for multi-channel WeCom to multi-instance OpenClaw messaging.
 homepage: https://github.com/lewiszeng666/wecom-openclaw-bridge-skill
-version: 1.1.0
+version: 3.1.0
 metadata:
   clawdbot:
-    emoji: "💼"
+    emoji: "🌉"
     requires:
-      env:
-        - WECOM_TOKEN
-        - WECOM_AES_KEY
-        - CORP_ID
-        - CORP_SECRET
-        - AGENT_ID
-        - OPENCLAW_TOKEN
       bins:
         - node
         - npm
     files:
       - scripts/bridge.js
-      - scripts/.env.example
+      - scripts/session-proxy.js
+      - scripts/channels.json.example
 ---
+# WeChat Work (WeCom) ↔ OpenClaw Multi-Channel Bridge
 
-# WeChat Work (WeCom) ↔ OpenClaw Integration Skill
-
-This skill helps developers quickly deploy a middleware bridge on a server with an existing OpenClaw installation. It connects a custom WeChat Work (WeCom) application to OpenClaw, enabling stable, reliable, bidirectional messaging with support for both text and images.
-
-## Features
-
-- **Stable & Reliable**: Uses a polling mechanism to check OpenClaw's session logs, avoiding the unreliability and timeouts associated with AI-initiated callbacks.
-- **Full-Featured**: Supports sending and receiving both text and image messages.
-- **Secure by Default**: All credentials are stored in a `.env` file that is excluded from version control via `.gitignore`.
-- **Simple Deployment**: Get up and running in three easy steps.
-- **Non-Intrusive**: Requires no modifications to the OpenClaw core code.
-
-## Architecture
-
-```
-WeCom User → WeCom Server → [Public Internet] → Webhook Bridge (Node.js) → [Local Network] → OpenClaw
-```
-
-## Prerequisites
-
-- A server with OpenClaw already installed and running.
-- A public IP address for the server.
-- Node.js (v16+) and npm installed.
-- Administrator access to your WeChat Work backend.
-
----
+This skill provides a robust, enterprise-grade bridge to connect one or more WeChat Work (WeCom) applications to one or more OpenClaw instances. It enables stable, bidirectional messaging (text & images) with support for both local and remote OpenClaw deployments.
 
 ## Three-Step Deployment Guide
+
+Full setup instructions are in the [README.md](README.md) file.
 
 ### Step 1: Configure WeChat Work Backend
 
@@ -65,47 +37,27 @@ WeCom User → WeCom Server → [Public Internet] → Webhook Bridge (Node.js) �
 
 ### Step 2: Deploy the Webhook Bridge
 
-1.  Copy the entire `scripts/` folder from this skill to your server, e.g., `/home/ubuntu/wecom-bridge`.
-2.  Navigate into that directory and install dependencies:
+1.  Copy the `scripts/` folder to your server and install dependencies:
     ```bash
-    cd /home/ubuntu/wecom-bridge
+    cd scripts/
     npm install
     ```
-3.  Create your local configuration file from the template:
+2.  Create your configuration file:
     ```bash
-    cp .env.example .env
+    cp channels.json.example channels.json
     ```
-4.  Edit `.env` and fill in all required values:
-
-    | Variable | Source |
-    |---|---|
-    | `WECOM_TOKEN` | Token generated in the WeCom backend. |
-    | `WECOM_AES_KEY` | EncodingAESKey generated in the WeCom backend. |
-    | `CORP_ID` | Your Corporation ID. |
-    | `CORP_SECRET` | Your app's Secret. |
-    | `AGENT_ID` | Your app's AgentId (a number). |
-    | `OPENCLAW_TOKEN` | The `hooks.token` value from `~/.openclaw/openclaw.json`. |
-
-5.  Start the bridge (using `pm2` for persistent background execution):
+3.  Edit `channels.json` and fill in your credentials.
+4.  Start the bridge (using `pm2` for production):
     ```bash
     npm install -g pm2
     pm2 start bridge.js --name wecom-bridge
     ```
-
-6.  Return to the WeCom admin console, enter `http://YOUR_PUBLIC_IP:3000/wecom` as the URL, and click **Save**. You should see `✅ URL validation successful` in the bridge logs (`pm2 logs wecom-bridge`).
+5.  Return to the WeCom admin console, enter `http://YOUR_PUBLIC_IP:3000/wecom/<channel-path>` as the URL, and click **Save**.
 
 ### Step 3: Configure OpenClaw
 
-1.  **Enable Webhooks**: Edit `~/.openclaw/openclaw.json`. The `hooks.token` here must match `OPENCLAW_TOKEN` in your `.env`.
-    ```json
-    {
-      "hooks": {
-        "enabled": true,
-        "token": "a_very_long_and_random_string_you_generate"
-      }
-    }
-    ```
-2.  **Create a Replier Skill**: Teaches OpenClaw how to format image replies.
+1.  **Enable Webhooks**: Ensure `hooks.enabled` is `true` in `~/.openclaw/openclaw.json` and that the `token` matches the one in `channels.json`.
+2.  **Image Reply Skill**: To teach OpenClaw how to send images, create a simple skill:
     ```bash
     mkdir -p ~/.openclaw/workspace/skills/wecom-replier
     cat > ~/.openclaw/workspace/skills/wecom-replier/SKILL.md << 'EOF'
@@ -118,19 +70,11 @@ WeCom User → WeCom Server → [Public Internet] → Webhook Bridge (Node.js) �
     The webhook bridge will automatically detect this and send the image.
     EOF
     ```
-3.  **Restart OpenClaw** to apply the new configuration and skill:
+3.  **Restart OpenClaw** to apply changes:
     ```bash
     openclaw gateway restart
     ```
 
----
+## Remote OpenClaw Setup
 
-## Security & Privacy
-
-- **Credential Security**: All sensitive credentials (`WECOM_SECRET`, `OPENCLAW_TOKEN`, etc.) are stored in a `.env` file on your server. This file is listed in `.gitignore` and will never be committed to version control.
-- **Data Flow**: Messages are relayed through the `bridge.js` service on your own server to your OpenClaw instance. No data passes through any third-party service.
-- **External Endpoints**: `bridge.js` only communicates with `https://qyapi.weixin.qq.com` (WeChat Work's official API) and your local OpenClaw instance.
-
-## Trust Statement
-
-By installing and using this skill, you understand and agree that your WeChat Work message data will be processed by the `bridge.js` service that you deploy and will be sent to your OpenClaw instance. Ensure you trust the security of the environment where you deploy this service.
+If you have OpenClaw on a remote machine, deploy `session-proxy.js` on that machine. See the [README.md](README.md) for detailed instructions.

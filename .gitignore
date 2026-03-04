@@ -1,28 +1,12 @@
-# 环境配置文件
-.env
-.env.local
-.env.prod
-.env.dev
+# macOS
+.DS_Store
 
-# Python 项目
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-venv/
-env/
-
-# Node.js 项目
+# Node.js
 node_modules/
 npm-debug.log
-yarn-error.log
 
-# 日志文件
-*.log
-logs/
+# Configuration (contains secrets — never commit this)
+scripts/channels.json
 
-# 临时文件
-*.tmp
-*.swp
-.DS_Store  # macOS 系统文件
-scripts/.env
+# Logs
+scripts/logs/

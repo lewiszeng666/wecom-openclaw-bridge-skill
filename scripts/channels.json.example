@@ -1,0 +1,46 @@
+{
+  "bridge": {
+    "port": 3000,
+    "logDir": "/var/log/wecom-bridge"
+  },
+  "channels": [
+    {
+      "_comment": "Local channel: OpenClaw runs on the same machine as bridge",
+      "id": "team-a",
+      "path": "/wecom/team-a",
+      "wecom": {
+        "token": "YOUR_WECOM_TOKEN_HERE",
+        "aesKey": "YOUR_43_CHAR_AES_KEY_HERE=",
+        "corpId": "YOUR_CORP_ID_HERE",
+        "corpSecret": "YOUR_APP_SECRET_HERE",
+        "agentId": 1000001
+      },
+      "openclaw": {
+        "host": "127.0.0.1",
+        "port": 18789,
+        "token": "YOUR_OPENCLAW_HOOKS_TOKEN_HERE",
+        "sessionsDir": "/home/ubuntu/.openclaw/agents/main/sessions"
+      }
+    },
+    {
+      "_comment": "Remote channel: OpenClaw runs on a different machine (requires session-proxy.js deployed there)",
+      "id": "team-b",
+      "path": "/wecom/team-b",
+      "wecom": {
+        "token": "ANOTHER_WECOM_TOKEN",
+        "aesKey": "ANOTHER_43_CHAR_AES_KEY=",
+        "corpId": "YOUR_CORP_ID_HERE",
+        "corpSecret": "ANOTHER_APP_SECRET",
+        "agentId": 1000002
+      },
+      "openclaw": {
+        "host": "192.168.1.100",
+        "port": 18789,
+        "token": "REMOTE_OPENCLAW_TOKEN",
+        "sessionsDir": null,
+        "proxyPort": 3001,
+        "proxyAuthToken": "A_STRONG_SECRET_FOR_PROXY_AUTH"
+      }
+    }
+  ]
+}

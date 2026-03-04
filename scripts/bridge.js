@@ -1,4 +1,16 @@
-require("dotenv").config();
+/**
+ * WeChat Work ↔ OpenClaw Multi-Channel Bridge
+ * Version: 3.1.0
+ *
+ * Features:
+ * - Multiple WeCom apps → Multiple OpenClaw instances routing
+ * - Per-channel message queues (no cross-channel blocking)
+ * - Per-channel log files
+ * - Local (file) and Remote (HTTP session-proxy) OpenClaw support
+ * - Stable retry/timeout handling
+ *
+ * Config: channels.json (see channels.json.example)
+ */
 
 const express = require("express");
 const axios = require("axios");
@@ -6,477 +18,448 @@ const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
 const FormData = require("form-data");
-const https = require("https");
-const http = require("http");
 const { XMLParser } = require("fast-xml-parser");
 const WXBizMsgCrypt = require("wechat-crypto");
 
 // ============================================================
-// Configuration — loaded from .env (see .env.example)
+// Logger
 // ============================================================
 
-// Auto-detect the OpenClaw sessions directory
-function detectSessionsDir() {
-  const os = require("os");
-  const candidates = [
-    path.join(os.homedir(), ".openclaw", "agents", "main", "sessions"),
-    "/root/.openclaw/agents/main/sessions",
-    "/home/ubuntu/.openclaw/agents/main/sessions",
-  ];
-  for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
+class Logger {
+  constructor(logDir, channelId = "bridge") {
+    this.logDir = logDir;
+    this.channelId = channelId;
+    this.logPath = path.join(logDir, `${channelId}.log`);
+    try {
+      if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    } catch (e) {
+      console.error(`[Logger] Failed to create log dir ${logDir}: ${e.message}`);
+    }
   }
-  // Fall back to home-based path even if it doesn't exist yet
-  return path.join(os.homedir(), ".openclaw", "agents", "main", "sessions");
+
+  _write(level, ...args) {
+    const prefix = `[${new Date().toISOString()}] [${level.padEnd(5)}] [${this.channelId}]`;
+    const msg = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+    const line = `${prefix} ${msg}\n`;
+    try { fs.appendFileSync(this.logPath, line); } catch {}
+    if (level === "ERROR" || level === "WARN") process.stderr.write(line);
+    else process.stdout.write(line);
+  }
+
+  info(...a)  { this._write("INFO",  ...a); }
+  warn(...a)  { this._write("WARN",  ...a); }
+  error(...a) { this._write("ERROR", ...a); }
+  debug(...a) { this._write("DEBUG", ...a); }
 }
 
-const CONFIG = {
-  WECOM_TOKEN:    process.env.WECOM_TOKEN,
-  WECOM_AES_KEY:  process.env.WECOM_AES_KEY,
-  CORP_ID:        process.env.CORP_ID,
-  CORP_SECRET:    process.env.CORP_SECRET,
-  AGENT_ID:       parseInt(process.env.AGENT_ID || "0", 10),
-  OPENCLAW_TOKEN: process.env.OPENCLAW_TOKEN,
-  OPENCLAW_PORT:  parseInt(process.env.OPENCLAW_PORT || "18789", 10),
-  BRIDGE_PORT:    parseInt(process.env.BRIDGE_PORT || "3000", 10),
-  SESSIONS_DIR:   process.env.SESSIONS_DIR || detectSessionsDir(),
-};
-
-// Validate required config values on startup
-const REQUIRED = ["WECOM_TOKEN", "WECOM_AES_KEY", "CORP_ID", "CORP_SECRET", "AGENT_ID", "OPENCLAW_TOKEN"];
-const missing = REQUIRED.filter((k) => !CONFIG[k]);
-if (missing.length > 0) {
-  console.error(`\n❌ Missing required environment variables: ${missing.join(", ")}`);
-  console.error("   Please copy .env.example to .env and fill in all required values.\n");
-  process.exit(1);
-}
+// ============================================================
+// Utility: extract text from OpenClaw content block
 // ============================================================
 
-const cryptor = new WXBizMsgCrypt(CONFIG.WECOM_TOKEN, CONFIG.WECOM_AES_KEY, CONFIG.CORP_ID);
-const xmlParser = new XMLParser();
-const app = express();
-app.use(express.raw({ type: "*/*", limit: "15mb" }));
-
-// --- Get WeCom Access Token ---
-async function getAccessToken() {
-  const res = await axios.get(
-    `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${CONFIG.CORP_ID}&corpsecret=${CONFIG.CORP_SECRET}`
-  );
-  if (res.data.errcode && res.data.errcode !== 0) {
-    throw new Error(`Failed to get AccessToken: ${res.data.errmsg}`);
+function extractTextFromContent(content) {
+  if (!content) return null;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const item = content.find((c) => c.type === "text");
+    if (item) return item.text;
+    const parts = content.map((c) => c.text || c.value || "").filter(Boolean);
+    return parts.length > 0 ? parts.join("\n") : null;
   }
-  return res.data.access_token;
+  return String(content);
 }
 
-// --- Send Text Message to WeCom ---
-async function sendTextToWecom(userId, text) {
-  try {
-    const accessToken = await getAccessToken();
+// ============================================================
+// WeComChannel
+// ============================================================
+
+class WeComChannel {
+  constructor(channelConfig, logger) {
+    this.cfg = channelConfig;
+    this.log = logger;
+    this.cryptor = new WXBizMsgCrypt(
+      channelConfig.wecom.token,
+      channelConfig.wecom.aesKey,
+      channelConfig.wecom.corpId
+    );
+    this.xmlParser = new XMLParser();
+    this._queue = [];
+    this._busy = false;
+    this._accessToken = null;
+    this._tokenExpiry = 0;
+  }
+
+  // ---- WeCom Access Token (with simple in-memory cache) ----
+
+  async getAccessToken() {
+    if (this._accessToken && Date.now() < this._tokenExpiry) return this._accessToken;
+    const { corpId, corpSecret } = this.cfg.wecom;
+    const res = await axios.get(
+      `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${corpId}&corpsecret=${corpSecret}`
+    );
+    if (res.data.errcode && res.data.errcode !== 0)
+      throw new Error(`Failed to get AccessToken: ${res.data.errmsg}`);
+    this._accessToken = res.data.access_token;
+    this._tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
+    return this._accessToken;
+  }
+
+  // ---- WeCom Send Helpers ----
+
+  async sendTextToWecom(userId, text) {
+    try {
+      const token = await this.getAccessToken();
+      const res = await axios.post(
+        `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${token}`,
+        { touser: userId, msgtype: "text", agentid: this.cfg.wecom.agentId, text: { content: text } }
+      );
+      this.log.info(`✅ Text sent to ${userId} | errcode=${res.data.errcode}`);
+    } catch (e) {
+      this.log.error(`❌ Failed to send text to ${userId}: ${e.message}`);
+    }
+  }
+
+  async uploadMedia(filePath, type) {
+    const token = await this.getAccessToken();
+    const form = new FormData();
+    const mimeMap = { image: "image/jpeg", voice: "audio/amr", video: "video/mp4", file: "application/octet-stream" };
+    form.append("media", fs.createReadStream(filePath), { filename: path.basename(filePath), contentType: mimeMap[type] || "application/octet-stream" });
     const res = await axios.post(
-      `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
-      { touser: userId, msgtype: "text", agentid: CONFIG.AGENT_ID, text: { content: text } }
+      `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${token}&type=${type}`,
+      form, { headers: form.getHeaders() }
     );
-    console.log("✅ Text sent to:", userId, "| WeCom API response:", JSON.stringify(res.data));
-  } catch (e) {
-    console.error("❌ Failed to send text message:", e.message);
+    if (res.data.errcode && res.data.errcode !== 0) throw new Error(res.data.errmsg);
+    return res.data.media_id;
   }
-}
 
-// --- Upload and Send Image to WeCom ---
-async function sendImageToWecom(userId, imagePath) {
-  try {
-    if (!fs.existsSync(imagePath)) {
-      console.error("❌ Image file not found:", imagePath);
-      await sendTextToWecom(userId, `Image file not found: ${imagePath}`);
-      return;
+  async sendMediaToWecom(userId, filePath, type) {
+    try {
+      if (!fs.existsSync(filePath)) { await this.sendTextToWecom(userId, `[File not found: ${filePath}]`); return; }
+      const token = await this.getAccessToken();
+      const mediaId = await this.uploadMedia(filePath, type);
+      const body = { touser: userId, msgtype: type, agentid: this.cfg.wecom.agentId, [type]: { media_id: mediaId } };
+      const res = await axios.post(`https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${token}`, body);
+      this.log.info(`✅ ${type} sent to ${userId} | errcode=${res.data.errcode}`);
+    } catch (e) {
+      this.log.error(`❌ Failed to send ${type} to ${userId}: ${e.message}`);
+      await this.sendTextToWecom(userId, `Failed to send ${type}: ${e.message}`);
     }
-    const accessToken = await getAccessToken();
-    const form = new FormData();
-    form.append("media", fs.createReadStream(imagePath), {
-      filename: path.basename(imagePath),
-      contentType: "image/png",
-    });
-    const uploadRes = await axios.post(
-      `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${accessToken}&type=image`,
-      form,
-      { headers: form.getHeaders() }
-    );
-    if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
-      throw new Error(`Failed to upload image: ${uploadRes.data.errmsg}`);
-    }
-    const mediaId = uploadRes.data.media_id;
-    console.log("📎 Image uploaded, media_id:", mediaId);
-    const sendRes = await axios.post(
-      `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
-      { touser: userId, msgtype: "image", agentid: CONFIG.AGENT_ID, image: { media_id: mediaId } }
-    );
-    console.log("✅ Image sent to:", userId, "| WeCom API response:", JSON.stringify(sendRes.data));
-  } catch (e) {
-    console.error("❌ Failed to send image:", e.message);
-    await sendTextToWecom(userId, `Failed to send image: ${e.message}`);
   }
-}
 
-// --- Upload and Send Voice to WeCom ---
-async function sendVoiceToWecom(userId, voicePath) {
-  try {
-    if (!fs.existsSync(voicePath)) {
-      console.error("❌ Voice file not found:", voicePath);
-      await sendTextToWecom(userId, `Voice file not found: ${voicePath}`);
-      return;
-    }
-    const accessToken = await getAccessToken();
-    const form = new FormData();
-    form.append("media", fs.createReadStream(voicePath), {
-      filename: path.basename(voicePath),
-      contentType: "audio/amr",  // WeCom only supports amr format
-    });
-    const uploadRes = await axios.post(
-      `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${accessToken}&type=voice`,
-      form,
-      { headers: form.getHeaders() }
-    );
-    if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
-      throw new Error(`Failed to upload voice: ${uploadRes.data.errmsg}`);
-    }
-    const mediaId = uploadRes.data.media_id;
-    console.log("🎤 Voice uploaded, media_id:", mediaId);
-    const sendRes = await axios.post(
-      `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
-      { touser: userId, msgtype: "voice", agentid: CONFIG.AGENT_ID, voice: { media_id: mediaId } }
-    );
-    console.log("✅ Voice sent to:", userId, "| WeCom API response:", JSON.stringify(sendRes.data));
-  } catch (e) {
-    console.error("❌ Failed to send voice:", e.message);
-    await sendTextToWecom(userId, `Failed to send voice: ${e.message}`);
+  async sendReplyToWecom(userId, rawReply) {
+    const finalMatch = rawReply.match(/<final>([\s\S]*?)<\/final>/);
+    const text = finalMatch ? finalMatch[1].trim() : rawReply.trim();
+    const imagePaths = [...text.matchAll(/\[IMAGE:(.*?)\]/g)].map((m) => m[1].trim());
+    const voicePaths = [...text.matchAll(/\[VOICE:(.*?)\]/g)].map((m) => m[1].trim());
+    const videoPaths = [...text.matchAll(/\[VIDEO:(.*?)\]/g)].map((m) => m[1].trim());
+    const filePaths  = [...text.matchAll(/\[FILE:(.*?)\]/g)].map((m) => m[1].trim());
+    const textOnly = text.replace(/\[(IMAGE|VOICE|VIDEO|FILE):.*?\]/g, "").trim();
+
+    if (textOnly) await this.sendTextToWecom(userId, textOnly);
+    for (const p of imagePaths) await this.sendMediaToWecom(userId, p, "image");
+    for (const p of voicePaths) await this.sendMediaToWecom(userId, p, "voice");
+    for (const p of videoPaths) await this.sendMediaToWecom(userId, p, "video");
+    for (const p of filePaths)  await this.sendMediaToWecom(userId, p, "file");
+    if (!textOnly && imagePaths.length === 0 && voicePaths.length === 0 && videoPaths.length === 0 && filePaths.length === 0)
+      await this.sendTextToWecom(userId, "(Received an empty reply)");
   }
-}
 
-// --- Upload and Send Video to WeCom ---
-async function sendVideoToWecom(userId, videoPath) {
-  try {
-    if (!fs.existsSync(videoPath)) {
-      console.error("❌ Video file not found:", videoPath);
-      await sendTextToWecom(userId, `Video file not found: ${videoPath}`);
-      return;
-    }
-    const accessToken = await getAccessToken();
-    const form = new FormData();
-    form.append("media", fs.createReadStream(videoPath), {
-      filename: path.basename(videoPath),
-      contentType: "video/mp4",
-    });
-    const uploadRes = await axios.post(
-      `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${accessToken}&type=video`,
-      form,
-      { headers: form.getHeaders() }
-    );
-    if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
-      throw new Error(`Failed to upload video: ${uploadRes.data.errmsg}`);
-    }
-    const mediaId = uploadRes.data.media_id;
-    console.log("🎬 Video uploaded, media_id:", mediaId);
-    const sendRes = await axios.post(
-      `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
-      { touser: userId, msgtype: "video", agentid: CONFIG.AGENT_ID, video: { media_id: mediaId } }
-    );
-    console.log("✅ Video sent to:", userId, "| WeCom API response:", JSON.stringify(sendRes.data));
-  } catch (e) {
-    console.error("❌ Failed to send video:", e.message);
-    await sendTextToWecom(userId, `Failed to send video: ${e.message}`);
-  }
-}
+  // ---- Media Download ----
 
-// --- Upload and Send File to WeCom ---
-async function sendFileToWecom(userId, filePath) {
-  try {
-    if (!fs.existsSync(filePath)) {
-      console.error("❌ File not found:", filePath);
-      await sendTextToWecom(userId, `File not found: ${filePath}`);
-      return;
-    }
-    const accessToken = await getAccessToken();
-    const form = new FormData();
-    form.append("media", fs.createReadStream(filePath), {
-      filename: path.basename(filePath),
-      contentType: "application/octet-stream",
-    });
-    const uploadRes = await axios.post(
-      `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${accessToken}&type=file`,
-      form,
-      { headers: form.getHeaders() }
-    );
-    if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
-      throw new Error(`Failed to upload file: ${uploadRes.data.errmsg}`);
-    }
-    const mediaId = uploadRes.data.media_id;
-    console.log("📎 File uploaded, media_id:", mediaId);
-    const sendRes = await axios.post(
-      `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`,
-      { touser: userId, msgtype: "file", agentid: CONFIG.AGENT_ID, file: { media_id: mediaId } }
-    );
-    console.log("✅ File sent to:", userId, "| WeCom API response:", JSON.stringify(sendRes.data));
-  } catch (e) {
-    console.error("❌ Failed to send file:", e.message);
-    await sendTextToWecom(userId, `Failed to send file: ${e.message}`);
-  }
-}
-
-// --- Parse AI reply to separate text, images, voice, video, and files ---
-function parseReply(rawText) {
-  const finalMatch = rawText.match(/<final>([\s\S]*?)<\/final>/);
-  const text = finalMatch ? finalMatch[1].trim() : rawText.trim();
-  const imagePaths = [...text.matchAll(/\[IMAGE:(.*?)\]/g)].map((m) => m[1].trim());
-  const voicePaths = [...text.matchAll(/\[VOICE:(.*?)\]/g)].map((m) => m[1].trim());
-  const videoPaths = [...text.matchAll(/\[VIDEO:(.*?)\]/g)].map((m) => m[1].trim());
-  const filePaths = [...text.matchAll(/\[FILE:(.*?)\]/g)].map((m) => m[1].trim());
-  const textOnly = text
-    .replace(/\[IMAGE:.*?\]/g, "")
-    .replace(/\[VOICE:.*?\]/g, "")
-    .replace(/\[VIDEO:.*?\]/g, "")
-    .replace(/\[FILE:.*?\]/g, "")
-    .trim();
-  return { textOnly, imagePaths, voicePaths, videoPaths, filePaths };
-}
-
-// --- Send final reply (text + images + voice + video + files) to WeCom ---
-async function sendReplyToWecom(userId, rawReply) {
-  const { textOnly, imagePaths, voicePaths, videoPaths, filePaths } = parseReply(rawReply);
-  if (textOnly) await sendTextToWecom(userId, textOnly);
-  for (const imgPath of imagePaths) await sendImageToWecom(userId, imgPath);
-  for (const voicePath of voicePaths) await sendVoiceToWecom(userId, voicePath);
-  for (const videoPath of videoPaths) await sendVideoToWecom(userId, videoPath);
-  for (const filePath of filePaths) await sendFileToWecom(userId, filePath);
-  if (!textOnly && imagePaths.length === 0 && voicePaths.length === 0 && videoPaths.length === 0 && filePaths.length === 0)
-    await sendTextToWecom(userId, "(Received an empty reply)");
-}
-
-// --- Get the latest assistant reply from a session file ---
-async function getLatestAssistantReply(sessionFile, afterTimestamp) {
-  return new Promise((resolve) => {
-    const lines = [];
-    const rl = readline.createInterface({ input: fs.createReadStream(sessionFile), crlfDelay: Infinity });
-    rl.on("line", (line) => { try { lines.push(JSON.parse(line)); } catch {} });
-    rl.on("close", () => {
-      const reply = lines.find(
-        (l) =>
-          l.type === "message" &&
-          l.message?.role === "assistant" &&
-          new Date(l.timestamp) > afterTimestamp &&
-          l.message.content?.some((c) => c.type === "text")
-      );
-      if (reply) {
-        const textContent = reply.message.content.find((c) => c.type === "text");
-        resolve(textContent ? textContent.text : null);
-      } else {
-        resolve(null);
-      }
-    });
-  });
-}
-
-// --- Poll for OpenClaw's reply (up to maxWaitMs) ---
-async function waitForReply(sessionFile, afterTimestamp, maxWaitMs = 60000) {
-  const interval = 1500;
-  for (let i = 0; i < Math.ceil(maxWaitMs / interval); i++) {
-    await new Promise((r) => setTimeout(r, interval));
-    const reply = await getLatestAssistantReply(sessionFile, afterTimestamp);
-    if (reply) return reply;
-  }
-  return null;
-}
-
-// --- Find the most recently modified session file ---
-function getLatestSessionFile() {
-  try {
-    const files = fs
-      .readdirSync(CONFIG.SESSIONS_DIR)
-      .filter((f) => f.endsWith(".jsonl"))
-      .map((f) => ({ fullPath: path.join(CONFIG.SESSIONS_DIR, f), mtime: fs.statSync(path.join(CONFIG.SESSIONS_DIR, f)).mtime }))
-      .sort((a, b) => b.mtime - a.mtime);
-    return files.length > 0 ? files[0].fullPath : null;
-  } catch (e) {
-    console.error("❌ Failed to read sessions directory:", e.message);
-    return null;
-  }
-}
-
-// --- Download media from WeCom API ---
-async function downloadMedia(mediaId, type = "image") {
-  try {
-    const accessToken = await getAccessToken();
-    const url = `https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token=${accessToken}&media_id=${mediaId}`;
-    const response = await axios({
-      method: 'get',
-      url: url,
-      responseType: 'stream'
-    });
-
-    const ext = type === "voice" ? "amr" : type === "video" ? "mp4" : "jpg";
-    const filename = `/tmp/wecom_${type}_${Date.now()}.${ext}`;
-    const writer = fs.createWriteStream(filename);
-
-    response.data.pipe(writer);
-
-    return new Promise((resolve, reject) => {
-      writer.on('finish', () => {
-        console.log(`📎 Downloaded ${type} to:`, filename);
-        resolve(filename);
+  async downloadMedia(mediaId, type) {
+    try {
+      const token = await this.getAccessToken();
+      const url = `https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token=${token}&media_id=${mediaId}`;
+      const extMap = { voice: "amr", video: "mp4", image: "jpg", file: "bin" };
+      const filename = `/tmp/wecom_${this.cfg.id}_${type}_${Date.now()}.${extMap[type] || "bin"}`;
+      const response = await axios({ method: "get", url, responseType: "stream" });
+      const writer = fs.createWriteStream(filename);
+      response.data.pipe(writer);
+      return new Promise((resolve, reject) => {
+        writer.on("finish", () => { this.log.debug(`Downloaded ${type}: ${filename}`); resolve(filename); });
+        writer.on("error", reject);
       });
-      writer.on('error', reject);
-    });
-  } catch (e) {
-    console.error(`❌ Failed to download ${type}:`, e.message);
+    } catch (e) {
+      this.log.error(`Failed to download ${type}: ${e.message}`);
+      return null;
+    }
+  }
+
+  // ---- OpenClaw Wake ----
+
+  async wakeOpenClaw(text) {
+    const oc = this.cfg.openclaw;
+    try {
+      if (oc.sessionsDir) {
+        // Local mode: call OpenClaw directly
+        const res = await axios.post(
+          `http://${oc.host}:${oc.port}/hooks/wake`,
+          { text, mode: "now" },
+          { headers: { Authorization: `Bearer ${oc.token}`, "Content-Type": "application/json" }, timeout: 10000 }
+        );
+        this.log.info(`📤 Woke up OpenClaw (local) at ${oc.host}:${oc.port}, status: ${res.status}`);
+      } else {
+        // Remote mode: proxy wake through session-proxy
+        const proxyPort = oc.proxyPort || (oc.port + 1);
+        const proxyToken = oc.proxyAuthToken || null;
+        const headers = { "Content-Type": "application/json" };
+        if (proxyToken) headers["Authorization"] = `Bearer ${proxyToken}`;
+        const res = await axios.post(
+          `http://${oc.host}:${proxyPort}/wake`,
+          { text, mode: "now", openclawToken: oc.token },
+          { headers, timeout: 10000 }
+        );
+        this.log.info(`📤 Woke up OpenClaw (via proxy) at ${oc.host}:${proxyPort}, status: ${res.status}`);
+      }
+      return true;
+    } catch (e) {
+      this.log.error(`❌ Failed to wake OpenClaw: ${e.message}`);
+      return false;
+    }
+  }
+
+  // ---- Session File (Local) ----
+
+  getLocalMainSessionFile(sessionsDir) {
+    const indexPath = path.join(sessionsDir, "sessions.json");
+    try {
+      if (fs.existsSync(indexPath)) {
+        const index = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
+        const mainKey = Object.keys(index).find((k) => k.includes("main"));
+        if (mainKey && index[mainKey]) {
+          const entry = index[mainKey];
+          if (entry.sessionFile && fs.existsSync(entry.sessionFile)) return entry.sessionFile;
+          if (entry.sessionId) {
+            const fp = path.join(sessionsDir, `${entry.sessionId}.jsonl`);
+            if (fs.existsSync(fp)) return fp;
+          }
+        }
+      }
+    } catch (e) { this.log.warn(`Could not read sessions.json: ${e.message}`); }
+
+    // Fallback: latest .jsonl
+    try {
+      const files = fs.readdirSync(sessionsDir)
+        .filter((f) => f.endsWith(".jsonl"))
+        .map((f) => ({ fp: path.join(sessionsDir, f), mt: fs.statSync(path.join(sessionsDir, f)).mtime }))
+        .sort((a, b) => b.mt - a.mt);
+      if (files.length > 0) { this.log.debug(`Fallback session: ${path.basename(files[0].fp)}`); return files[0].fp; }
+    } catch (e) { this.log.error(`Failed to list sessions dir: ${e.message}`); }
     return null;
   }
-}
 
-// --- Handle WeCom message (text, image, voice, video, file) ---
-async function handleWecomMessage(userId, text, mediaType = null, mediaId = null) {
-  console.log(`\n📩 Processing message | User: ${userId} | Text: ${text || '(none)'} | Media: ${mediaType || 'none'}`);
-
-  let messageText = text || "";
-  let attachmentPath = null;
-
-  // If there's media, download it first
-  if (mediaType && mediaId) {
-    attachmentPath = await downloadMedia(mediaId, mediaType);
-    if (attachmentPath) {
-      messageText = `[${mediaType.toUpperCase()}:${attachmentPath}] ` + (text || "");
-    }
+  async readLocalReply(sessionFile, afterTimestamp) {
+    return new Promise((resolve) => {
+      const lines = [];
+      const rl = readline.createInterface({ input: fs.createReadStream(sessionFile), crlfDelay: Infinity });
+      rl.on("line", (l) => { try { lines.push(JSON.parse(l)); } catch {} });
+      rl.on("close", () => {
+        const reply = lines.find((l) => {
+          const ts = l.timestamp || l.createdAt;
+          if (!ts || new Date(ts) <= afterTimestamp) return false;
+          const role = l.message?.role ?? l.role;
+          if (role !== "assistant") return false;
+          return !!(l.message?.content ?? l.content);
+        });
+        if (reply) resolve(extractTextFromContent(reply.message?.content ?? reply.content));
+        else resolve(null);
+      });
+    });
   }
 
-  const sendTime = new Date();
+  // ---- Reply Polling (Local or Remote) ----
 
-  try {
-    const wakeRes = await axios.post(
-      `http://127.0.0.1:${CONFIG.OPENCLAW_PORT}/hooks/wake`,
-      { text: `【WeCom Message】User ${userId} says: ${messageText}`, mode: "now" },
-      { headers: { Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}`, "Content-Type": "application/json" } }
-    );
-    console.log("📤 Woke up OpenClaw, status:", wakeRes.status, "| Waiting for reply...");
-  } catch (e) {
-    console.error("❌ Failed to wake OpenClaw:", e.message);
-    await sendTextToWecom(userId, "The service is temporarily unavailable. Please try again later.");
-    return;
-  }
+  async pollForReply(afterTimestamp, maxWaitMs = 300000) {
+    const oc = this.cfg.openclaw;
+    const interval = 1500;
+    const maxAttempts = Math.ceil(maxWaitMs / interval);
 
-  await new Promise((r) => setTimeout(r, 2000));
-
-  const sessionFile = getLatestSessionFile();
-  if (!sessionFile) {
-    console.error("❌ Could not find session file.");
-    await sendTextToWecom(userId, "Service error. Please try again later.");
-    return;
-  }
-  console.log("📂 Polling session file:", path.basename(sessionFile));
-
-  const reply = await waitForReply(sessionFile, sendTime, 300000);
-  if (reply) {
-    console.log("💬 OpenClaw reply:", reply.substring(0, 100) + (reply.length > 100 ? "..." : ""));
-    await sendReplyToWecom(userId, reply);
-  } else {
-    console.error("⏰ Timed out (300s) waiting for OpenClaw reply.");
-    await sendTextToWecom(userId, "The request timed out. Please try again later.");
-  }
-}
-
-// --- WeCom Webhook Endpoint ---
-app.all("/wecom", (req, res) => {
-  console.log(`\n★ Received request: ${req.method} at ${new Date().toISOString()}`);
-  const { echostr } = req.query;
-
-  if (req.method === "GET") {
-    try {
-      const decrypted = cryptor.decrypt(echostr);
-      console.log("✅ URL validation successful.");
-      return res.send(decrypted.message);
-    } catch (e) {
-      console.error("❌ URL validation failed:", e.message);
-      return res.status(400).send("Validation failed");
-    }
-  }
-
-  if (req.method === "POST") {
-    res.status(200).send("success");
-    try {
-      const xmlData = req.body.toString("utf-8");
-      const parsed = xmlParser.parse(xmlData);
-      const encrypted = parsed.xml?.Encrypt;
-      if (!encrypted) { console.error("❌ No Encrypt field in message"); return; }
-
-      const decrypted = cryptor.decrypt(encrypted);
-      const message = xmlParser.parse(decrypted.message).xml;
-      console.log("📩 Message type:", message.MsgType, "| From:", message.FromUserName);
-
-      if (message.MsgType === "text") {
-        handleWecomMessage(message.FromUserName, message.Content).catch((e) => {
-          console.error("❌ Error during message handling:", e.message);
-        });
-      } else if (message.MsgType === "image") {
-        handleWecomMessage(message.FromUserName, "[收到图片]", "image", message.MediaId).catch((e) => {
-          console.error("❌ Error during image handling:", e.message);
-        });
-      } else if (message.MsgType === "voice") {
-        handleWecomMessage(message.FromUserName, "[收到语音]", "voice", message.MediaId).catch((e) => {
-          console.error("❌ Error during voice handling:", e.message);
-        });
-      } else if (message.MsgType === "video") {
-        handleWecomMessage(message.FromUserName, "[收到视频]", "video", message.MediaId).catch((e) => {
-          console.error("❌ Error during video handling:", e.message);
-        });
-      } else if (message.MsgType === "file") {
-        handleWecomMessage(message.FromUserName, "[收到文件]", "file", message.MediaId).catch((e) => {
-          console.error("❌ Error during file handling:", e.message);
-        });
-      } else {
-        console.log("⚠️ Unsupported message type:", message.MsgType, "(ignored)");
+    if (oc.sessionsDir) {
+      // Local mode
+      const sessionFile = this.getLocalMainSessionFile(oc.sessionsDir);
+      if (!sessionFile) { this.log.error("No local session file found."); return null; }
+      this.log.info(`📂 Polling local session: ${path.basename(sessionFile)}`);
+      for (let i = 0; i < maxAttempts; i++) {
+        await new Promise((r) => setTimeout(r, interval));
+        const reply = await this.readLocalReply(sessionFile, afterTimestamp);
+        if (reply) return reply;
       }
+    } else {
+      // Remote mode via session-proxy
+      const proxyHost = oc.host;
+      const proxyPort = oc.proxyPort || (oc.port + 1);
+      const proxyToken = oc.proxyAuthToken || null;
+      const url = `http://${proxyHost}:${proxyPort}/session/latest?after=${afterTimestamp.toISOString()}`;
+      const headers = proxyToken ? { Authorization: `Bearer ${proxyToken}` } : {};
+      this.log.info(`📡 Polling remote session proxy: ${proxyHost}:${proxyPort}`);
+      for (let i = 0; i < maxAttempts; i++) {
+        await new Promise((r) => setTimeout(r, interval));
+        try {
+          const res = await axios.get(url, { headers, timeout: 5000 });
+          if (res.data && res.data.reply) return res.data.reply;
+        } catch (e) {
+          if (e.code !== "ECONNREFUSED" && e.response?.status !== 404)
+            this.log.warn(`Proxy poll error: ${e.message}`);
+        }
+      }
+    }
+    return null;
+  }
+
+  // ---- Message Queue & Core Handler ----
+
+  enqueue(userId, msgType, content, mediaId) {
+    this._queue.push({ userId, msgType, content, mediaId });
+    this._processQueue();
+  }
+
+  async _processQueue() {
+    if (this._busy || this._queue.length === 0) return;
+    this._busy = true;
+    const item = this._queue.shift();
+    try {
+      await this._handleMessage(item);
     } catch (e) {
-      console.error("❌ Failed to decrypt/parse message:", e.message);
+      this.log.error(`Unhandled error: ${e.message}`);
+      try { await this.sendTextToWecom(item.userId, "An unexpected error occurred."); } catch {}
+    }
+    this._busy = false;
+    this._processQueue();
+  }
+
+  async _handleMessage({ userId, msgType, content, mediaId }) {
+    this.log.info(`📩 Processing | User: ${userId} | Type: ${msgType} | Content: ${content || "(none)"}`);
+
+    let messageText = content || "";
+    if (mediaId) {
+      const filePath = await this.downloadMedia(mediaId, msgType);
+      if (filePath) messageText = `[${msgType.toUpperCase()}:${filePath}] ` + (content || "");
+    }
+
+    const sendTime = new Date();
+    const ok = await this.wakeOpenClaw(
+      `【WeCom Message | Channel: ${this.cfg.id}】User ${userId} says: ${messageText}`
+    );
+    if (!ok) {
+      await this.sendTextToWecom(userId, "The service is temporarily unavailable. Please try again later.");
+      return;
+    }
+
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const reply = await this.pollForReply(sendTime);
+    if (reply) {
+      this.log.info(`💬 Reply: ${reply.substring(0, 100)}${reply.length > 100 ? "..." : ""}`);
+      await this.sendReplyToWecom(userId, reply);
+    } else {
+      this.log.warn(`⏰ Timed out waiting for reply (user: ${userId})`);
+      await this.sendTextToWecom(userId, "The request timed out. Please try again later.");
     }
   }
-});
 
-// --- Detect public IP (tries multiple services, falls back gracefully) ---
-function getPublicIp() {
-  return new Promise((resolve) => {
-    const services = [
-      { host: "api4.ipify.org",        path: "/" },
-      { host: "ipv4.icanhazip.com",    path: "/" },
-      { host: "checkip.amazonaws.com", path: "/" },
-    ];
-    let tried = 0;
-    function tryNext() {
-      if (tried >= services.length) { resolve(null); return; }
-      const svc = services[tried++];
-      const req = https.get(
-        { host: svc.host, path: svc.path, timeout: 3000 },
-        (res) => {
-          let data = "";
-          res.on("data", (c) => (data += c));
-          res.on("end", () => {
-            const ip = data.trim();
-            if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) resolve(ip);
-            else tryNext();
-          });
-        }
-      );
-      req.on("error", tryNext);
-      req.on("timeout", () => { req.destroy(); tryNext(); });
+  // ---- Express Request Handler ----
+
+  handleRequest(req, res) {
+    this.log.debug(`★ ${req.method} ${req.path}`);
+    const { echostr } = req.query;
+
+    if (req.method === "GET") {
+      try {
+        const decrypted = this.cryptor.decrypt(echostr);
+        this.log.info("✅ URL validation successful.");
+        return res.send(decrypted.message);
+      } catch (e) {
+        this.log.error(`❌ URL validation failed: ${e.message}`);
+        return res.status(400).send("Validation failed");
+      }
     }
-    tryNext();
+
+    if (req.method === "POST") {
+      res.status(200).send("success"); // Must respond within 5s
+      try {
+        const xmlData = req.body.toString("utf-8");
+        const parsed = this.xmlParser.parse(xmlData);
+        const encrypted = parsed.xml?.Encrypt;
+        if (!encrypted) { this.log.error("No Encrypt field in message"); return; }
+        const decrypted = this.cryptor.decrypt(encrypted);
+        const message = this.xmlParser.parse(decrypted.message).xml;
+        this.log.info(`📩 Message type: ${message.MsgType} | From: ${message.FromUserName}`);
+
+        const userId = message.FromUserName;
+        switch (message.MsgType) {
+          case "text":  this.enqueue(userId, "text",  message.Content, null); break;
+          case "image": this.enqueue(userId, "image", "[收到图片]",     message.MediaId); break;
+          case "voice": this.enqueue(userId, "voice", "[收到语音]",     message.MediaId); break;
+          case "video": this.enqueue(userId, "video", "[收到视频]",     message.MediaId); break;
+          case "file":  this.enqueue(userId, "file",  "[收到文件]",     message.MediaId); break;
+          default: this.log.debug(`Unsupported message type: ${message.MsgType} (ignored)`);
+        }
+      } catch (e) {
+        this.log.error(`Failed to decrypt/parse message: ${e.message}`);
+      }
+    }
+  }
+}
+
+// ============================================================
+// Main Entry Point
+// ============================================================
+
+function main() {
+  const configPath = path.resolve(process.env.CHANNELS_CONFIG || path.join(__dirname, "channels.json"));
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch (e) {
+    console.error(`FATAL: Could not load config from ${configPath}: ${e.message}`);
+    process.exit(1);
+  }
+
+  const bridgeCfg = config.bridge || {};
+  const logDir = bridgeCfg.logDir || path.join(__dirname, "logs");
+  const port = bridgeCfg.port || 3000;
+
+  const globalLog = new Logger(logDir, "bridge");
+  globalLog.info(`Loading config from: ${configPath}`);
+
+  if (!Array.isArray(config.channels) || config.channels.length === 0) {
+    globalLog.error("FATAL: No channels defined in channels.json");
+    process.exit(1);
+  }
+
+  const app = express();
+  app.use(express.raw({ type: "*/*", limit: "15mb" }));
+
+  // Health check endpoint
+  app.get("/health", (req, res) => {
+    res.json({ status: "ok", channels: config.channels.map((c) => c.id), timestamp: new Date().toISOString() });
+  });
+
+  for (const channelCfg of config.channels) {
+    // Validate required fields
+    const required = ["id", "path", "wecom.token", "wecom.aesKey", "wecom.corpId", "wecom.corpSecret", "wecom.agentId", "openclaw.host", "openclaw.port", "openclaw.token"];
+    const missing = required.filter((k) => {
+      const parts = k.split(".");
+      let obj = channelCfg;
+      for (const p of parts) { if (!obj || obj[p] === undefined) return true; obj = obj[p]; }
+      return false;
+    });
+    if (missing.length > 0) {
+      globalLog.error(`Channel "${channelCfg.id}" is missing required fields: ${missing.join(", ")} — SKIPPED`);
+      continue;
+    }
+
+    const channelLog = new Logger(logDir, channelCfg.id);
+    const channel = new WeComChannel(channelCfg, channelLog);
+    app.all(channelCfg.path, (req, res) => channel.handleRequest(req, res));
+    globalLog.info(`Registered channel "${channelCfg.id}" at ${channelCfg.path} → OpenClaw ${channelCfg.openclaw.host}:${channelCfg.openclaw.port}`);
+  }
+
+  app.listen(port, () => {
+    globalLog.info(`\n🚀 Multi-Channel Bridge v3.0.0 started on port ${port}`);
+    globalLog.info(`   Health check: http://localhost:${port}/health`);
+    globalLog.info(`   Log directory: ${logDir}`);
+    globalLog.info(`   Channels: ${config.channels.map((c) => `${c.id} → ${c.path}`).join(", ")}`);
   });
 }
 
-// --- Start the server ---
-app.listen(CONFIG.BRIDGE_PORT, async () => {
-  console.log(`\n🚀 Webhook Bridge started, listening on port ${CONFIG.BRIDGE_PORT}`);
-  const publicIp = await getPublicIp();
-  const callbackUrl = publicIp
-    ? `http://${publicIp}:${CONFIG.BRIDGE_PORT}/wecom`
-    : `http://YOUR_SERVER_IP:${CONFIG.BRIDGE_PORT}/wecom`;
-  console.log(`   WeCom callback URL: ${callbackUrl}`);
-  if (!publicIp) console.log(`   (Could not detect public IP — replace YOUR_SERVER_IP manually)`);
-  console.log(`   Watching Sessions Dir: ${CONFIG.SESSIONS_DIR}`);
-});
+main();
