@@ -1,7 +1,7 @@
 {
   "bridge": {
     "port": 3000,
-    "logDir": "/var/log/wecom-bridge"
+    "logDir": "./logs"
   },
   "channels": [
     {
@@ -10,7 +10,7 @@
       "path": "/wecom/team-a",
       "wecom": {
         "token": "YOUR_WECOM_TOKEN_HERE",
-        "aesKey": "YOUR_43_CHAR_AES_KEY_HERE=",
+        "aesKey": "YOUR_43_CHAR_AES_KEY_HERE",
         "corpId": "YOUR_CORP_ID_HERE",
         "corpSecret": "YOUR_APP_SECRET_HERE",
         "agentId": 1000001
@@ -28,7 +28,7 @@
       "path": "/wecom/team-b",
       "wecom": {
         "token": "ANOTHER_WECOM_TOKEN",
-        "aesKey": "ANOTHER_43_CHAR_AES_KEY=",
+        "aesKey": "ANOTHER_43_CHAR_AES_KEY",
         "corpId": "YOUR_CORP_ID_HERE",
         "corpSecret": "ANOTHER_APP_SECRET",
         "agentId": 1000002

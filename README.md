@@ -6,7 +6,31 @@
 
 This project provides a robust, enterprise-grade bridge to connect one or more WeChat Work (WeCom) applications to one or more OpenClaw instances. It enables stable, bidirectional messaging (text & images) with support for both local and remote OpenClaw deployments.
 
-![Architecture Diagram](https://your-image-host.com/architecture.png)  *(Placeholder for architecture diagram)*
+```
+WeCom User → WeCom Server → [Public Internet] → bridge.js → [Local/Remote] → OpenClaw
+                                                      ↑
+                                              channels.json
+                                         (routes each /wecom/<id>
+                                          to the right OpenClaw)
+```
+
+---
+
+## Repository Structure
+
+```
+wecom-openclaw-bridge-skill/
+├── .gitignore                  # Excludes channels.json and logs/
+├── SKILL.md                    # ClawHub skill definition
+├── README.md                   # This file
+├── LICENSE                     # MIT License
+└── scripts/
+    ├── bridge.js               # Main bridge service (multi-channel)
+    ├── session-proxy.js        # Lightweight proxy for remote OpenClaw machines
+    ├── channels.json.example   # Configuration template — copy to channels.json
+    ├── setup.js                # Optional: auto-detects OpenClaw and pre-fills config
+    └── package.json            # Node.js dependencies
+```
 
 ---
 
